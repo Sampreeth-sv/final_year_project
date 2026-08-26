@@ -1,0 +1,4 @@
+{
+  "fusion_threshold": 0.5,
+  "_comment": "Decision threshold for the fusion engine. A flow with fusion_score >= fusion_threshold is predicted as an attack (fusion_prediction=1). Configurable without code changes."
+}

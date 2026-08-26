@@ -1,0 +1,15 @@
+{
+  "input_dim": 7,
+  "hidden_dim": 32,
+  "feature_names": [
+    "out_degree",
+    "in_degree",
+    "total_bytes",
+    "total_packets",
+    "port_entropy",
+    "protocol_diversity",
+    "retransmit_total"
+  ],
+  "malicious_ratio_threshold": 0.5,
+  "min_flows_for_label": 3
+}
