@@ -250,8 +250,8 @@ class InferenceEngine:
         fusion_result = self._fusion.fuse(
             xgb_score=xgb_prob,
             ae_score=ae_score,
-            gnn_score=None,       # PARTIAL FUSION: GNN not yet available
-            temporal_score=None,  # PARTIAL FUSION: Temporal not yet available
+            gnn_score=None,       # Will be populated by Person 1's GNN when available
+            temporal_score=None,  # Will be populated by Temporal component when available
         )
 
         t_end = time.perf_counter()
@@ -281,13 +281,20 @@ class InferenceEngine:
             "ae_mse"     : round(ae_mse, 6),
             "ae_score"   : round(ae_score, 6),    # normalized [0,1]
             "ae_pred"    : ae_pred,
-            # ── GNN / Temporal (not yet available — Person 1 integration) ────
-            "gnn_score"      : None,   # will be provided by Person 1's GNN
-            "temporal_score" : None,   # will be provided by Temporal component
+            # ── GNN / Temporal (from Person 1 integration when available) ────
+            "gnn_score"      : fusion_result.get("scores", {}).get("gnn"),
+            "temporal_score" : fusion_result.get("scores", {}).get("temporal"),
             # ── Fusion ───────────────────────────────────────────────────────
             "fusion_score" : fusion_result["fusion_score"],
             "fusion_pred"  : fusion_result["fusion_prediction"],
             "fusion_mode"  : fusion_result["fusion_mode"],
+            "fusion_weights" : fusion_result.get("weights", {}),
+            "fusion_scores"  : fusion_result.get("scores", {}),
+            "fusion_confidence": fusion_result.get("confidence", {}),
+            "fusion_consistency": fusion_result.get("consistency", {}),
+            "fusion_reliability": fusion_result.get("reliability", {}),
+            "available_components": fusion_result.get("available_components", []),
+            "missing_components": fusion_result.get("missing_components", []),
             # ── Performance ──────────────────────────────────────────────────
             "inference_latency_ms": latency_ms,
         }

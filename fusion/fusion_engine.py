@@ -1,64 +1,52 @@
 """
-fusion_engine.py
-================
-AI-Powered Network Intrusion Detection System — FUSION ENGINE
+fusion/fusion_engine.py
+=======================
+Dynamic Multi-Model Fusion Engine
 
-Implements the fixed-weight fusion of detection signals from multiple models.
+Implements entropy-based confidence and consistency-weighted dynamic fusion
+of detection signals from XGBoost, Autoencoder, GNN, and Temporal models.
 
-Current available components:
-  - XGBoost (active)
-  - Autoencoder (active)
-  - Bipartite GNN (NOT YET AVAILABLE — Person 1 integration pending)
-  - Temporal Correlation (NOT YET AVAILABLE — pending implementation)
+Core equations:
+- Confidence: C = 1 - H_norm(p) where H_norm(p) = H(p)/log(2) for probabilities
+- Consistency: Cons_i = 1 - normalized(|S_i - mean_score|)
+- Reliability: R_i = C_i × Cons_i
+- Dynamic weight: w_i = R_i / Σ R_j
+- Full fusion: S_fusion = Σ w_i × S_i
 
-Full fusion weights (per architecture spec):
-    S_fusion = 0.35 * S_XGB + 0.20 * S_AE + 0.25 * S_GNN + 0.20 * S_Temporal
-
-Partial fusion (XGB + AE only — normalized over available components):
-    XGB effective weight = 0.35 / (0.35 + 0.20) = 0.35 / 0.55 ≈ 0.63636
-    AE  effective weight = 0.20 / (0.35 + 0.20) = 0.20 / 0.55 ≈ 0.36364
-
-    S_partial = (0.35/0.55) * S_XGB + (0.20/0.55) * S_AE
-
-Score normalization contract:
-    All input scores MUST be in [0, 1].
-    S_XGB  = XGBoost attack probability
-    S_AE   = AE MSE normalized via xgb_ae_mse_max (leakage-free artifact)
-    S_GNN  = GNN malicious probability (Person 1 integration, not yet available)
-    S_TEMPORAL = Temporal correlation risk score (not yet available)
-
-Usage:
-    from fusion_engine import FusionEngine
-    fe = FusionEngine(threshold=0.5)
-    result = fe.fuse(xgb_score=0.85, ae_score=0.62)
+Author: Claude Code | Hybrid Architecture Plan
 """
 
-import os
+import math
 import json
+import os
 import logging
+from typing import Optional, Dict, Any
 
 logger = logging.getLogger(__name__)
 
-# ── Fixed architecture weights (per spec) ─────────────────────────────────────
-_WEIGHT_XGB      = 0.35
-_WEIGHT_AE       = 0.20
-_WEIGHT_GNN      = 0.25
-_WEIGHT_TEMPORAL = 0.20
-_WEIGHT_TOTAL    = _WEIGHT_XGB + _WEIGHT_AE + _WEIGHT_GNN + _WEIGHT_TEMPORAL
-
-assert abs(_WEIGHT_TOTAL - 1.0) < 1e-9, "Fusion weights must sum to 1.0"
-
-# ── Default threshold config path ─────────────────────────────────────────────
-_HERE            = os.path.dirname(os.path.abspath(__file__))
-_FUSION_CFG_PATH = os.path.join(_HERE, "..", "models", "fusion_config.json")
-
+# Default configuration
 _DEFAULT_THRESHOLD = 0.5
+_TEMPORAL_NORMALIZATION_FACTOR = 100.0  # Scale factor for GRU norm -> [0,1]
+
+# Config path
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_FUSION_CFG_PATH = os.path.join(_HERE, "..", "models", "fusion_config.json")
 
 
 def load_fusion_threshold(config_path: str = _FUSION_CFG_PATH) -> float:
     """
     Load the fusion decision threshold from fusion_config.json.
     Falls back to _DEFAULT_THRESHOLD (0.5) if the file does not exist.
+
+    Parameters
+    ----------
+    config_path : str
+        Path to the fusion configuration JSON file
+
+    Returns
+    -------
+    float
+        The fusion threshold value
     """
     if os.path.exists(config_path):
         try:
@@ -80,82 +68,344 @@ def load_fusion_threshold(config_path: str = _FUSION_CFG_PATH) -> float:
     return _DEFAULT_THRESHOLD
 
 
-class FusionEngine:
+# =============================================================================
+# SCORE NORMALIZATION
+# =============================================================================
+
+def normalize_temporal_score(raw_norm: float, max_norm: float = 100.0) -> float:
     """
-    Fixed-weight fusion of XGBoost, Autoencoder, GNN, and Temporal signals.
+    Normalize raw GRU hidden state L2 norm to [0, 1].
 
-    Operates in two explicit modes:
+    The temporal signal is the L2 norm of GRU hidden states.
+    Without normalization, it can be arbitrarily large.
 
-    PARTIAL FUSION — GNN/TEMPORAL NOT YET AVAILABLE
-        Weights renormalized over the two available components:
-            w_XGB_eff = 0.35 / 0.55 ≈ 0.6364
-            w_AE_eff  = 0.20 / 0.55 ≈ 0.3636
+    Uses a logistic (sigmoid) normalization:
+        S(x) = 1 / (1 + exp(-k * (x - x0)))
 
-    FULL FUSION (when all four genuine scores are provided)
-        S_fusion = 0.35*S_XGB + 0.20*S_AE + 0.25*S_GNN + 0.20*S_Temporal
+    where x0 = max_norm/2 (midpoint) and k controls steepness.
+    This maps:
+        - norm ≈ 0 → score ≈ 0.007 (essentially 0)
+        - norm ≈ max_norm/2 → score ≈ 0.5 (neutral)
+        - norm ≈ max_norm → score ≈ 0.993 (essentially 1)
+
+    Higher values = higher temporal activity = higher risk.
 
     Parameters
     ----------
-    threshold : float
-        Decision threshold for fusion_prediction (default: 0.5).
-        Scores >= threshold → prediction = 1 (attack).
+    raw_norm : float
+        Raw L2 norm of GRU hidden state
+    max_norm : float
+        Expected maximum norm for scaling (default 100.0)
+
+    Returns
+    -------
+    float
+        Normalized temporal score in [0, 1]
+    """
+    norm = max(0.0, raw_norm)
+    # Sigmoid centered at max_norm/2 with steepness k = 4/max_norm
+    k = 4.0 / max(max_norm, 1e-6)
+    x0 = max_norm / 2.0
+    normalized = 1.0 / (1.0 + math.exp(-k * (norm - x0)))
+    return float(normalized)
+
+
+# =============================================================================
+# ENTROPY-BASED CONFIDENCE
+# =============================================================================
+
+def calculate_entropy(p: float) -> float:
+    """
+    Calculate binary entropy H(p) = -p*log2(p) - (1-p)*log2(1-p)
+
+    Returns 0 for p=0 or p=1 (certain), 1.0 for p=0.5 (maximum uncertainty).
+    """
+    if p <= 0.0 or p >= 1.0:
+        return 0.0
+    # Clamp to avoid log(0)
+    p = max(1e-10, min(1 - 1e-10, p))
+    return -p * math.log2(p) - (1 - p) * math.log2(1 - p)
+
+
+def calculate_normalized_entropy(p: float) -> float:
+    """
+    Normalize entropy to [0, 1] by dividing by log2(2) = 1.
+
+    For binary entropy, this is just H(p) since log2(2) = 1.
+
+    Returns:
+        Normalized entropy: 0 (certain) to 1 (maximum uncertainty)
+    """
+    return calculate_entropy(p)
+
+
+def calculate_confidence(p: float) -> float:
+    """
+    Calculate confidence from probability using entropy.
+
+    Confidence = 1 - H_norm(p)
+
+    - p ≈ 0 or p ≈ 1 → high confidence (low entropy)
+    - p ≈ 0.5 → low confidence (high entropy)
+
+    Returns:
+        Confidence in [0, 1]
+    """
+    return 1.0 - calculate_normalized_entropy(p)
+
+
+# =============================================================================
+# CONSISTENCY CALCULATION
+# =============================================================================
+
+def calculate_consistency(score: float, other_scores: list) -> float:
+    """
+    Calculate consistency of a score relative to other available scores.
+
+    Consistency = 1 - normalized_distance
+    where normalized_distance = |score - mean| / (max - min + ε)
+
+    A detector is consistent when its score is close to the mean of
+    all available scores (agreement with other evidence).
+
+    Parameters
+    ----------
+    score : float
+        The score to evaluate for consistency
+    other_scores : list of float
+        Other available scores for comparison
+
+    Returns
+    -------
+    float
+        Consistency in [0, 1]
+    """
+    if not other_scores:
+        return 1.0  # No other signals to be consistent with
+
+    all_scores = [score] + other_scores
+    min_s = min(all_scores)
+    max_s = max(all_scores)
+    range_s = max_s - min_s
+
+    if range_s < 1e-10:  # All scores identical
+        return 1.0
+
+    mean_score = sum(all_scores) / len(all_scores)
+    distance = abs(score - mean_score)
+    normalized_distance = distance / range_s
+
+    consistency = 1.0 - normalized_distance
+    return max(0.0, consistency)
+
+
+# =============================================================================
+# RELIABILITY CALCULATION
+# =============================================================================
+
+def calculate_reliability(confidence: float, consistency: float) -> float:
+    """
+    Calculate reliability as the product of confidence and consistency.
+
+    R = C × Cons
+
+    A detector is reliable when it has both:
+    - High confidence in its own assessment
+    - Agreement with other available detectors
+    """
+    return confidence * consistency
+
+
+# =============================================================================
+# DYNAMIC WEIGHT CALCULATION
+# =============================================================================
+
+def calculate_dynamic_weights(
+    xgb_prob: float,
+    ae_score: float,
+    gnn_score: Optional[float] = None,
+    temporal_score: Optional[float] = None,
+) -> Dict[str, float]:
+    """
+    Calculate dynamic fusion weights based on confidence and consistency.
+
+    For each detector:
+    1. Calculate confidence (entropy-based for probabilities, proxy for non-probabilities)
+    2. Calculate consistency relative to other detectors
+    3. Compute reliability = confidence × consistency
+    4. Normalize reliabilities to get weights: w_i = R_i / Σ R_j
+
+    Returns
+    -------
+    dict with keys: xgb, ae, gnn, temporal (None if not available)
+    """
+    # --- XGBoost: direct probability, entropy-based confidence ---
+    c_xgb = calculate_confidence(xgb_prob)
+
+    # --- Autoencoder: anomaly score [0,1], use distance from 0.5 as confidence proxy ---
+    # An AE score near 0 or 1 is more confident (clearly normal or anomalous)
+    # Score near 0.5 is ambiguous
+    # Formula: 2 * |x - 0.5| maps [0,1] to [0,1], min at 0.5, max at 0/1
+    ae_certainty = 2 * abs(ae_score - 0.5)
+    c_ae = max(0.0, min(1.0, ae_certainty))
+
+    # Available scores for consistency calculation
+    available_scores = [xgb_prob, ae_score]
+    available_names = ['xgb', 'ae']
+
+    # --- GNN: if available, it's a probability from sigmoid ---
+    if gnn_score is not None:
+        c_gnn = calculate_confidence(gnn_score)
+        available_scores.append(gnn_score)
+        available_names.append('gnn')
+    else:
+        c_gnn = 0.0
+
+    # --- Temporal: if available, normalize first, then use confidence proxy ---
+    if temporal_score is not None:
+        # temporal_score is raw L2 norm - should be normalized before this function
+        # If passed as raw norm, normalize it
+        if temporal_score > 1.0:
+            t_normalized = normalize_temporal_score(temporal_score)
+        else:
+            t_normalized = temporal_score
+
+        # Confidence: 2 * |t_normalized - 0.5| maps [0,1] to [0,1],
+        # min at 0.5 (uncertain), max at 0/1 (clear)
+        c_temp = max(0.0, min(1.0, 2 * abs(t_normalized - 0.5)))
+        available_scores.append(t_normalized)
+        available_names.append('temporal')
+    else:
+        t_normalized = None
+        c_temp = 0.0
+
+    # --- Calculate consistency ---
+    # Each detector's consistency relative to others
+    cons_xgb = calculate_consistency(xgb_prob, available_scores[1:])
+    cons_ae = calculate_consistency(ae_score, [xgb_prob])
+
+    if gnn_score is not None:
+        cons_gnn = calculate_consistency(gnn_score, available_scores[:2])
+    else:
+        cons_gnn = 0.0
+
+    if temporal_score is not None:
+        cons_temp = calculate_consistency(t_normalized, [xgb_prob, ae_score])
+    else:
+        cons_temp = 0.0
+
+    # --- Calculate reliabilities ---
+    r_xgb = calculate_reliability(c_xgb, cons_xgb)
+    r_ae = calculate_reliability(c_ae, cons_ae)
+    r_gnn = calculate_reliability(c_gnn, cons_gnn) if gnn_score is not None else 0.0
+    r_temp = calculate_reliability(c_temp, cons_temp) if temporal_score is not None else 0.0
+
+    # --- Normalize to weights ---
+    total_r = r_xgb + r_ae
+    if gnn_score is not None:
+        total_r += r_gnn
+    if temporal_score is not None:
+        total_r += r_temp
+
+    if total_r < 1e-10:
+        # Fallback: equal weights if all reliabilities are zero
+        # Must normalize so weights sum to 1.0
+        n_available = 2 + (1 if gnn_score is not None else 0) + (1 if temporal_score is not None else 0)
+        w_xgb  = 1.0 / n_available
+        w_ae   = 1.0 / n_available
+        w_gnn  = 1.0 / n_available if gnn_score is not None else 0.0
+        w_temp = 1.0 / n_available if temporal_score is not None else 0.0
+    else:
+        w_xgb = r_xgb / total_r
+        w_ae = r_ae / total_r
+        w_gnn = r_gnn / total_r if gnn_score is not None else 0.0
+        w_temp = r_temp / total_r if temporal_score is not None else 0.0
+
+    return {
+        'xgb': w_xgb,
+        'ae': w_ae,
+        'gnn': w_gnn if gnn_score is not None else None,
+        'temporal': w_temp if temporal_score is not None else None,
+    }
+
+
+# =============================================================================
+# MAIN FUSION ENGINE
+# =============================================================================
+
+class FusionEngine:
+    """
+    Dynamic multi-model fusion engine with entropy-based confidence and
+    consistency-weighted reliability calculation.
+
+    Fusion Equation:
+        S_fusion = Σ w_i × S_i  for available detectors i
+
+        where w_i = R_i / Σ R_j, and R_i = C_i × Cons_i
+
+        - C_i = confidence (entropy-based for probabilities)
+        - Cons_i = consistency (agreement with other detectors)
+
+    Modes:
+        - "partial": Only XGB + AE available (default at startup)
+        - "full": All four detectors available
     """
 
-    # Full-fusion weights (architecture spec)
-    W_XGB      = _WEIGHT_XGB
-    W_AE       = _WEIGHT_AE
-    W_GNN      = _WEIGHT_GNN
-    W_TEMPORAL = _WEIGHT_TEMPORAL
-
-    # Partial-fusion effective weights (XGB + AE only, renormalized)
-    _PARTIAL_DENOM = _WEIGHT_XGB + _WEIGHT_AE  # 0.55
-    W_XGB_PARTIAL  = _WEIGHT_XGB / _PARTIAL_DENOM   # 0.35/0.55 ≈ 0.63636
-    W_AE_PARTIAL   = _WEIGHT_AE  / _PARTIAL_DENOM   # 0.20/0.55 ≈ 0.36364
-
     def __init__(self, threshold: float = _DEFAULT_THRESHOLD):
+        """
+        Initialize the FusionEngine.
+
+        Parameters
+        ----------
+        threshold : float
+            Decision threshold for fusion_prediction.
+            fusion_score >= threshold → prediction = 1 (attack)
+        """
         self.threshold = threshold
         logger.info(
-            "FusionEngine initialized. threshold=%.4f  "
-            "partial weights: XGB=%.5f AE=%.5f  "
-            "full weights: XGB=%.2f AE=%.2f GNN=%.2f Temporal=%.2f",
-            self.threshold,
-            self.W_XGB_PARTIAL, self.W_AE_PARTIAL,
-            self.W_XGB, self.W_AE, self.W_GNN, self.W_TEMPORAL,
+            "FusionEngine initialized. threshold=%.4f",
+            self.threshold
         )
 
     def fuse(
         self,
         xgb_score: float,
         ae_score: float,
-        gnn_score: float = None,
-        temporal_score: float = None,
-    ) -> dict:
+        gnn_score: Optional[float] = None,
+        temporal_score: Optional[float] = None,
+    ) -> Dict[str, Any]:
         """
-        Compute the fusion result from available component scores.
+        Compute dynamic fusion result from available component scores.
 
         Parameters
         ----------
         xgb_score : float
             XGBoost attack probability in [0, 1].
         ae_score : float
-            AE anomaly score normalized to [0, 1].
+            Autoencoder anomaly score in [0, 1] (already normalized).
         gnn_score : float or None
             GNN malicious probability in [0, 1].
-            Pass None until Person 1's GNN is integrated.
-            DO NOT pass a fabricated/random value.
+            None if not yet available.
         temporal_score : float or None
-            Temporal correlation risk score in [0, 1].
-            Pass None until the temporal component is implemented.
-            DO NOT pass a fabricated/random value.
+            Raw temporal score (L2 norm) or normalized [0, 1].
+            If > 1.0, will be normalized.
+            None if not yet available.
 
         Returns
         -------
         dict with keys:
-            xgb_score, ae_score, gnn_score, temporal_score,
-            available_components,
-            fusion_score, fusion_prediction, fusion_mode
+            - fusion_score: float in [0, 1]
+            - fusion_prediction: int (0 or 1)
+            - fusion_mode: "partial" or "full"
+            - weights: dict of dynamic weights
+            - scores: dict of all scores used in fusion
+            - available_components: list of available detector names
+            - missing_components: list of unavailable detector names
+            - confidence: dict of detector confidence values
+            - consistency: dict of detector consistency values
+            - reliability: dict of detector reliabilities
         """
-        # ── Input validation ──────────────────────────────────────────────────
+        # Input validation for mandatory scores
         for name, val in [("xgb_score", xgb_score), ("ae_score", ae_score)]:
             if not (0.0 <= val <= 1.0):
                 raise ValueError(
@@ -163,93 +413,150 @@ class FusionEngine:
                     "All scores must be normalized before fusion."
                 )
 
-        gnn_available      = gnn_score      is not None
-        temporal_available = temporal_score is not None
-
-        if gnn_available and not (0.0 <= gnn_score <= 1.0):
+        # Validate optional scores if provided
+        if gnn_score is not None and not (0.0 <= gnn_score <= 1.0):
             raise ValueError(
                 f"FusionEngine.fuse(): gnn_score={gnn_score!r} is not in [0, 1]."
             )
-        if temporal_available and not (0.0 <= temporal_score <= 1.0):
-            raise ValueError(
-                f"FusionEngine.fuse(): temporal_score={temporal_score!r} is not in [0, 1]."
-            )
 
-        available_components = {
-            "xgb":      True,
-            "ae":       True,
-            "gnn":      gnn_available,
-            "temporal": temporal_available,
-        }
+        if temporal_score is not None:
+            if temporal_score < 0:
+                raise ValueError(
+                    f"FusionEngine.fuse(): temporal_score={temporal_score!r} is negative."
+                )
+            # If temporal_score > 1, it's likely raw L2 norm - will normalize
 
-        # ── Fusion calculation ────────────────────────────────────────────────
-        if gnn_available and temporal_available:
-            # Full fusion: all four components present
-            fusion_score = (
-                self.W_XGB      * xgb_score
-                + self.W_AE       * ae_score
-                + self.W_GNN      * gnn_score
-                + self.W_TEMPORAL * temporal_score
-            )
-            fusion_mode = "full"
+        # Determine availability
+        gnn_available = gnn_score is not None
+        temporal_available = temporal_score is not None
 
+        available_components = ['xgb', 'ae']
+        missing_components = []
+
+        if gnn_available:
+            available_components.append('gnn')
         else:
-            # Partial fusion: ONLY XGB + AE (renormalized weights)
-            # Clearly labelled: PARTIAL FUSION — GNN/TEMPORAL NOT YET AVAILABLE
-            fusion_score = (
-                self.W_XGB_PARTIAL * xgb_score
-                + self.W_AE_PARTIAL  * ae_score
-            )
-            fusion_mode = "partial"
+            missing_components.append('gnn')
+
+        if temporal_available:
+            available_components.append('temporal')
+        else:
+            missing_components.append('temporal')
+
+        # Normalize temporal score if needed
+        if temporal_available and temporal_score > 1.0:
+            t_normalized = normalize_temporal_score(temporal_score)
+        else:
+            t_normalized = temporal_score if temporal_available else None
+
+        # Calculate dynamic weights
+        weights = calculate_dynamic_weights(
+            xgb_prob=xgb_score,
+            ae_score=ae_score,
+            gnn_score=gnn_score,
+            temporal_score=t_normalized,
+        )
+
+        # Calculate confidence values for each detector
+        c_xgb = calculate_confidence(xgb_score)
+        c_ae = max(0.0, min(1.0, 2 * abs(ae_score - 0.5)))
+        c_gnn = calculate_confidence(gnn_score) if gnn_available else None
+        c_temp = max(0.0, min(1.0, 2 * abs(t_normalized - 0.5))) if temporal_available else None
+
+        # Calculate consistency values
+        cons_xgb = calculate_consistency(
+            xgb_score,
+            [ae_score] +
+            ([gnn_score] if gnn_available else [])
+        )
+        cons_ae = calculate_consistency(ae_score, [xgb_score])
+        cons_gnn = calculate_consistency(gnn_score, [xgb_score, ae_score]) if gnn_available else None
+        cons_temp = calculate_consistency(t_normalized, [xgb_score, ae_score]) if temporal_available else None
+
+        # Calculate reliability values
+        r_xgb = calculate_reliability(c_xgb, cons_xgb)
+        r_ae = calculate_reliability(c_ae, cons_ae)
+        r_gnn = calculate_reliability(c_gnn, cons_gnn) if gnn_available else None
+        r_temp = calculate_reliability(c_temp, cons_temp) if temporal_available else None
+
+        # Calculate fusion score using dynamic weights
+        w_xgb = weights['xgb']
+        w_ae = weights['ae']
+        w_gnn = weights.get('gnn', 0.0) if gnn_available else 0.0
+        w_temp = weights.get('temporal', 0.0) if temporal_available else 0.0
+
+        fusion_score = (
+            w_xgb * xgb_score +
+            w_ae * ae_score
+        )
+
+        if gnn_available:
+            fusion_score += w_gnn * gnn_score
+
+        if temporal_available:
+            fusion_score += w_temp * t_normalized
 
         fusion_score = round(float(fusion_score), 6)
-        fusion_prediction = int(fusion_score >= self.threshold)
+        fusion_prediction = 1 if fusion_score >= self.threshold else 0
+
+        # Determine fusion mode
+        fusion_mode = "full" if (gnn_available and temporal_available) else "partial"
+
+        # Round weights
+        weights_rounded = {
+            k: round(v, 6) if v is not None else None
+            for k, v in weights.items()
+        }
 
         return {
-            # Individual component scores (None if not yet available)
-            "xgb_score"      : round(float(xgb_score), 6),
-            "ae_score"       : round(float(ae_score),  6),
-            "gnn_score"      : round(float(gnn_score), 6) if gnn_available else None,
-            "temporal_score" : round(float(temporal_score), 6) if temporal_available else None,
-            # Component availability
-            "available_components": available_components,
             # Fusion result
-            "fusion_score"      : fusion_score,
-            "fusion_prediction" : fusion_prediction,
-            "fusion_mode"       : fusion_mode,
+            "fusion_score": fusion_score,
+            "fusion_prediction": fusion_prediction,
+            "fusion_mode": fusion_mode,
+
+            # Dynamic weights
+            "weights": weights_rounded,
+
+            # Scores (normalized if needed)
+            "scores": {
+                "xgb": round(xgb_score, 6),
+                "ae": round(ae_score, 6),
+                "gnn": round(gnn_score, 6) if gnn_available else None,
+                "temporal": round(t_normalized, 6) if temporal_available else None,
+            },
+
+            # Detector metadata
+            "available_components": available_components,
+            "missing_components": missing_components,
+
+            # Confidence calculation transparency
+            "confidence": {
+                "xgb": round(c_xgb, 6),
+                "ae": round(c_ae, 6),
+                "gnn": round(c_gnn, 6) if gnn_available else None,
+                "temporal": round(c_temp, 6) if temporal_available else None,
+            },
+
+            "consistency": {
+                "xgb": round(cons_xgb, 6),
+                "ae": round(cons_ae, 6),
+                "gnn": round(cons_gnn, 6) if gnn_available else None,
+                "temporal": round(cons_temp, 6) if temporal_available else None,
+            },
+
+            "reliability": {
+                "xgb": round(r_xgb, 6),
+                "ae": round(r_ae, 6),
+                "gnn": round(r_gnn, 6) if gnn_available else None,
+                "temporal": round(r_temp, 6) if temporal_available else None,
+            },
         }
 
     @staticmethod
     def compute_partial_fusion(xgb_score: float, ae_score: float) -> float:
         """
-        Convenience method: compute partial fusion score directly.
-
-        Returns the scalar partial fusion score (not a full result dict).
-        Useful for testing the formula in isolation.
+        Legacy compatibility: compute partial fusion with fixed weights.
         """
-        return (
-            FusionEngine.W_XGB_PARTIAL * xgb_score
-            + FusionEngine.W_AE_PARTIAL  * ae_score
-        )
-
-    @staticmethod
-    def compute_full_fusion(
-        xgb_score: float,
-        ae_score: float,
-        gnn_score: float,
-        temporal_score: float,
-    ) -> float:
-        """
-        Convenience method: compute full fusion score directly.
-
-        Formula: 0.35*xgb + 0.20*ae + 0.25*gnn + 0.20*temporal
-
-        Returns the scalar full fusion score.
-        Useful for testing the formula in isolation.
-        """
-        return (
-            FusionEngine.W_XGB      * xgb_score
-            + FusionEngine.W_AE       * ae_score
-            + FusionEngine.W_GNN      * gnn_score
-            + FusionEngine.W_TEMPORAL * temporal_score
-        )
+        w_xgb = 0.35 / 0.55  # ≈ 0.63636
+        w_ae = 0.20 / 0.55   # ≈ 0.36364
+        return w_xgb * xgb_score + w_ae * ae_score

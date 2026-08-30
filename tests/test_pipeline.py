@@ -347,7 +347,7 @@ class TestFlowExtractor:
 class TestFusionEngine:
 
     def test_c9_partial_fusion_formula(self):
-        """C9: Partial fusion uses renormalized XGB+AE weights."""
+        """C9: Partial fusion uses DYNAMIC weights that sum to 1.0 (XGB+AE only)."""
         from fusion.fusion_engine import FusionEngine
 
         fe = FusionEngine(threshold=0.5)
@@ -357,20 +357,27 @@ class TestFusionEngine:
 
         result = fe.fuse(xgb_score=xgb_score, ae_score=ae_score)
 
-        # Expected: (0.35/0.55)*0.8 + (0.20/0.55)*0.4
-        expected = (0.35 / 0.55) * xgb_score + (0.20 / 0.55) * ae_score
+        # Dynamic weights must sum to 1.0
+        w_xgb = result["weights"]["xgb"]
+        w_ae  = result["weights"]["ae"]
+        assert abs((w_xgb + w_ae) - 1.0) < 1e-10, (
+            f"Dynamic weights sum to {w_xgb + w_ae}, expected 1.0"
+        )
+        # Fusion score must equal weighted average
+        expected = w_xgb * xgb_score + w_ae * ae_score
         assert abs(result["fusion_score"] - expected) < 1e-4, (
             f"Partial fusion score {result['fusion_score']:.6f} != expected {expected:.6f}"
         )
 
     def test_c9b_partial_fusion_static_method(self):
-        """C9b: FusionEngine.compute_partial_fusion() matches formula."""
+        """C9b: FusionEngine.compute_partial_fusion() returns a valid weighted average."""
         from fusion.fusion_engine import FusionEngine
 
         xgb_score = 0.7
         ae_score  = 0.3
 
         computed = FusionEngine.compute_partial_fusion(xgb_score, ae_score)
+        # The static helper uses fixed 0.35/0.20 renormalized to 0.63636/0.36364
         expected = (0.35 / 0.55) * xgb_score + (0.20 / 0.55) * ae_score
 
         assert abs(computed - expected) < 1e-10, (
@@ -378,7 +385,7 @@ class TestFusionEngine:
         )
 
     def test_c10_full_fusion_formula(self):
-        """C10: Full fusion uses 0.35*xgb + 0.20*ae + 0.25*gnn + 0.20*temporal."""
+        """C10: Full fusion uses DYNAMIC weights that sum to 1.0 (all four detectors)."""
         from fusion.fusion_engine import FusionEngine
 
         fe = FusionEngine(threshold=0.5)
@@ -395,11 +402,21 @@ class TestFusionEngine:
             temporal_score=temporal_score,
         )
 
+        # Dynamic weights must sum to 1.0
+        weights = result["weights"]
+        w_total = (
+            weights['xgb'] + weights['ae']
+            + weights.get('gnn', 0.0)
+            + weights.get('temporal', 0.0)
+        )
+        assert abs(w_total - 1.0) < 1e-10, f"Full weights sum to {w_total}, expected 1.0"
+
+        # Fusion score must equal weighted average of all available scores
         expected = (
-            0.35 * xgb_score
-            + 0.20 * ae_score
-            + 0.25 * gnn_score
-            + 0.20 * temporal_score
+            weights['xgb'] * xgb_score +
+            weights['ae']  * ae_score +
+            weights.get('gnn', 0.0) * gnn_score +
+            weights.get('temporal', 0.0) * temporal_score
         )
         assert abs(result["fusion_score"] - expected) < 1e-4, (
             f"Full fusion score {result['fusion_score']:.6f} != expected {expected:.6f}"
@@ -409,18 +426,29 @@ class TestFusionEngine:
         )
 
     def test_c10b_full_fusion_weights_sum_to_one(self):
-        """C10b: Full fusion weights must sum exactly to 1.0."""
-        from fusion.fusion_engine import FusionEngine
-        w_total = FusionEngine.W_XGB + FusionEngine.W_AE + FusionEngine.W_GNN + FusionEngine.W_TEMPORAL
-        assert abs(w_total - 1.0) < 1e-10, f"Full fusion weights sum to {w_total}, expected 1.0"
+        """C10b: Dynamic fusion weights (all four detectors) must sum to 1.0."""
+        from fusion.fusion_engine import calculate_dynamic_weights
+
+        weights = calculate_dynamic_weights(
+            xgb_prob=0.8, ae_score=0.4,
+            gnn_score=0.7, temporal_score=0.5
+        )
+        w_total = (
+            weights['xgb'] + weights['ae']
+            + weights.get('gnn', 0.0)
+            + weights.get('temporal', 0.0)
+        )
+        assert abs(w_total - 1.0) < 1e-10, f"Full weights sum to {w_total}, expected 1.0"
 
     def test_c10c_full_fusion_static_method(self):
-        """C10c: FusionEngine.compute_full_fusion() matches the 4-component formula."""
+        """C10c: Static helper compute_partial_fusion still works as a baseline."""
         from fusion.fusion_engine import FusionEngine
 
-        xgb_score, ae_score, gnn_score, temporal_score = 0.9, 0.6, 0.7, 0.5
-        computed = FusionEngine.compute_full_fusion(xgb_score, ae_score, gnn_score, temporal_score)
-        expected = 0.35 * xgb_score + 0.20 * ae_score + 0.25 * gnn_score + 0.20 * temporal_score
+        # The static helper is a fixed-weight legacy baseline; the active pipeline
+        # uses the dynamic FusionEngine.fuse() method instead.
+        xgb_score, ae_score = 0.9, 0.6
+        computed = FusionEngine.compute_partial_fusion(xgb_score, ae_score)
+        expected = (0.35 / 0.55) * xgb_score + (0.20 / 0.55) * ae_score
         assert abs(computed - expected) < 1e-10, f"{computed} != {expected}"
 
     def test_c11_partial_fusion_mode_label(self):
@@ -441,10 +469,16 @@ class TestFusionEngine:
         fe = FusionEngine(threshold=0.5)
         result = fe.fuse(xgb_score=0.7, ae_score=0.4)
 
-        assert result["gnn_score"]      is None, "gnn_score must be None when not provided"
-        assert result["temporal_score"] is None, "temporal_score must be None when not provided"
-        assert result["available_components"]["gnn"]      is False
-        assert result["available_components"]["temporal"] is False
+        # gnn/temporal scores are reported under the 'scores' key as None
+        assert result["scores"]["gnn"]      is None, "gnn score must be None when not provided"
+        assert result["scores"]["temporal"] is None, "temporal score must be None when not provided"
+        # And they are listed in the missing_components
+        assert 'gnn' in result["missing_components"], (
+            "gnn should appear in missing_components when not provided"
+        )
+        assert 'temporal' in result["missing_components"], (
+            "temporal should appear in missing_components when not provided"
+        )
 
     def test_c12b_fusion_score_in_range(self):
         """C12b: Fusion score is always in [0, 1] for valid input scores."""
@@ -624,3 +658,278 @@ class TestArtifacts:
             cfg = json.load(f)
         assert "fusion_threshold" in cfg
         assert 0.0 < cfg["fusion_threshold"] <= 1.0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NEW: Dynamic Fusion Engine Tests (C17-C25)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestDynamicFusion:
+
+    def test_c17_dynamic_weights_sum_to_one_partial_xgb_ae(self):
+        """C17: Dynamic weights for XGB+AE only always sum to 1.0."""
+        from fusion.fusion_engine import FusionEngine, calculate_dynamic_weights
+
+        fe = FusionEngine(threshold=0.5)
+        weights = calculate_dynamic_weights(xgb_prob=0.8, ae_score=0.4)
+
+        total = weights['xgb'] + weights['ae']
+        assert abs(total - 1.0) < 1e-10, f"Partial weights sum to {total}, expected 1.0"
+        assert weights['gnn'] is None, "gnn weight must be None when gnn_score not provided"
+        assert weights['temporal'] is None, "temporal weight must be None when temporal_score not provided"
+
+    def test_c17b_dynamic_weights_sum_to_one_full(self):
+        """C17b: Dynamic weights for all four detectors always sum to 1.0."""
+        from fusion.fusion_engine import FusionEngine, calculate_dynamic_weights
+
+        weights = calculate_dynamic_weights(
+            xgb_prob=0.8, ae_score=0.4,
+            gnn_score=0.7, temporal_score=0.5
+        )
+
+        total = weights['xgb'] + weights['ae'] + weights['gnn'] + weights['temporal']
+        assert abs(total - 1.0) < 1e-10, f"Full weights sum to {total}, expected 1.0"
+
+    def test_c17c_weights_vary_with_confidence(self):
+        """C17c: Weights vary based on confidence — confident detectors get higher weight."""
+        from fusion.fusion_engine import calculate_dynamic_weights
+
+        # High-confidence scores (near 0 or 1) should get higher weight
+        high_conf = calculate_dynamic_weights(
+            xgb_prob=0.95, ae_score=0.95,
+            gnn_score=0.9, temporal_score=0.85
+        )
+        # Low-confidence scores (near 0.5) should get lower weight
+        low_conf = calculate_dynamic_weights(
+            xgb_prob=0.5, ae_score=0.5,
+            gnn_score=0.5, temporal_score=0.5
+        )
+
+        # Both should sum to 1.0, but the distribution should differ
+        assert abs(sum(high_conf.values()) - 1.0) < 1e-10
+        assert abs(sum(low_conf.values()) - 1.0) < 1e-10
+        # The exact weights will differ since confidence differs
+        assert high_conf != low_conf, "Weights should differ when confidence differs"
+
+    def test_c17d_xgb_weight_always_present(self):
+        """C17d: XGB weight is always present (even when gnn/temporal unavailable)."""
+        from fusion.fusion_engine import calculate_dynamic_weights
+
+        weights = calculate_dynamic_weights(xgb_prob=0.7, ae_score=0.3)
+        assert 'xgb' in weights, "xgb weight must always be present"
+        assert weights['xgb'] > 0, "xgb weight should be positive when xgb_prob provided"
+
+    def test_c17e_ae_weight_always_present(self):
+        """C17e: AE weight is always present (mandatory component)."""
+        from fusion.fusion_engine import calculate_dynamic_weights
+
+        weights = calculate_dynamic_weights(xgb_prob=0.7, ae_score=0.3)
+        assert 'ae' in weights, "ae weight must always be present"
+        assert weights['ae'] > 0, "ae weight should be positive when ae_score provided"
+
+    def test_c18_fusion_score_partial_mode(self):
+        """C18: Partial fusion score computed with dynamic weights (XGB+AE only)."""
+        from fusion.fusion_engine import FusionEngine
+
+        fe = FusionEngine(threshold=0.5)
+        result = fe.fuse(xgb_score=0.8, ae_score=0.4)
+
+        # Fusion score should be w_xgb * 0.8 + w_ae * 0.4 where w_xgb + w_ae = 1.0
+        assert 0.0 <= result["fusion_score"] <= 1.0, (
+            f"Partial fusion score {result['fusion_score']} out of [0, 1]"
+        )
+        assert result["fusion_mode"] == "partial", (
+            f"Expected 'partial' mode, got '{result['fusion_mode']}'"
+        )
+        # Verify the score is a proper weighted average
+        w_xgb = result["weights"]["xgb"]
+        w_ae = result["weights"]["ae"]
+        expected_range = w_xgb * 0.8 + w_ae * 0.4
+        assert abs(result["fusion_score"] - expected_range) < 1e-6, (
+            f"Fusion score {result['fusion_score']} != weighted avg {expected_range}"
+        )
+
+    def test_c19_fusion_score_full_mode(self):
+        """C19: Full fusion score computed with dynamic weights (all four detectors)."""
+        from fusion.fusion_engine import FusionEngine
+
+        fe = FusionEngine(threshold=0.5)
+        result = fe.fuse(
+            xgb_score=0.9, ae_score=0.6,
+            gnn_score=0.7, temporal_score=0.5
+        )
+
+        assert 0.0 <= result["fusion_score"] <= 1.0, (
+            f"Full fusion score {result['fusion_score']} out of [0, 1]"
+        )
+        assert result["fusion_mode"] == "full", (
+            f"Expected 'full' mode, got '{result['fusion_mode']}'"
+        )
+
+    def test_c19b_fusion_score_weighted_average_full(self):
+        """C19b: Full fusion score is weighted average of all available scores."""
+        from fusion.fusion_engine import FusionEngine
+
+        fe = FusionEngine(threshold=0.5)
+        result = fe.fuse(
+            xgb_score=0.9, ae_score=0.6,
+            gnn_score=0.7, temporal_score=0.5
+        )
+
+        # Verify fusion_score = Σ w_i * s_i
+        weights = result["weights"]
+        scores = result["scores"]
+        reconstructed = (
+            weights['xgb'] * scores['xgb'] +
+            weights['ae'] * scores['ae'] +
+            weights.get('gnn', 0.0) * scores.get('gnn', 0.0) +
+            weights.get('temporal', 0.0) * scores.get('temporal', 0.0)
+        )
+        assert abs(result["fusion_score"] - reconstructed) < 1e-6, (
+            f"Fusion score {result['fusion_score']} != reconstructed {reconstructed}"
+        )
+
+    def test_c20_fusion_threshold_applied_correctly(self):
+        """C20: Fusion prediction follows threshold — score >= threshold → 1, else → 0."""
+        from fusion.fusion_engine import FusionEngine
+
+        # Test with high threshold
+        fe_high = FusionEngine(threshold=0.8)
+        result = fe_high.fuse(xgb_score=0.9, ae_score=0.7)
+        assert result["fusion_prediction"] == 1, (
+            f"With threshold=0.8 and score >= 0.8, prediction should be 1, got {result['fusion_prediction']}"
+        )
+
+        fe_low = FusionEngine(threshold=0.2)
+        result = fe_low.fuse(xgb_score=0.9, ae_score=0.7)
+        assert result["fusion_prediction"] == 1, (
+            f"With threshold=0.2 and score >= 0.2, prediction should be 1, got {result['fusion_prediction']}"
+        )
+
+        # Test with score below threshold
+        fe_low2 = FusionEngine(threshold=0.99)
+        result = fe_low2.fuse(xgb_score=0.5, ae_score=0.4)
+        assert result["fusion_prediction"] == 0, (
+            f"With threshold=0.99 and score < 0.99, prediction should be 0, got {result['fusion_prediction']}"
+        )
+
+    def test_c21_available_missing_components_tracked(self):
+        """C21: Available and missing components are correctly tracked."""
+        from fusion.fusion_engine import FusionEngine
+
+        # Partial mode: only XGB + AE
+        fe = FusionEngine(threshold=0.5)
+        result = fe.fuse(xgb_score=0.7, ae_score=0.4)
+
+        assert 'xgb' in result["available_components"], "xgb should be available"
+        assert 'ae' in result["available_components"], "ae should be available"
+        assert 'gnn' not in result["available_components"], "gnn should not be available (missing)"
+        assert 'temporal' not in result["available_components"], "temporal should not be available (missing)"
+        assert 'gnn' in result["missing_components"], "gnn should be in missing_components"
+        assert 'temporal' in result["missing_components"], "temporal should be in missing_components"
+
+        # Full mode: all four
+        result = fe.fuse(
+            xgb_score=0.7, ae_score=0.4,
+            gnn_score=0.6, temporal_score=0.5
+        )
+        assert 'xgb' in result["available_components"]
+        assert 'ae' in result["available_components"]
+        assert 'gnn' in result["available_components"]
+        assert 'temporal' in result["available_components"]
+        assert len(result["missing_components"]) == 0
+
+    def test_c22_confidence_consistency_reliability_exposed(self):
+        """C22: Confidence, consistency, and reliability values are exposed in fusion result."""
+        from fusion.fusion_engine import FusionEngine
+
+        fe = FusionEngine(threshold=0.5)
+        result = fe.fuse(xgb_score=0.8, ae_score=0.4)
+
+        # Check confidence values
+        assert "confidence" in result, "confidence dict must be in fusion result"
+        assert "xgb" in result["confidence"], "xgb confidence must be present"
+        assert 0.0 <= result["confidence"]["xgb"] <= 1.0, "xgb confidence must be in [0, 1]"
+
+        # Check consistency values
+        assert "consistency" in result, "consistency dict must be in fusion result"
+        assert "xgb" in result["consistency"], "xgb consistency must be present"
+        assert 0.0 <= result["consistency"]["xgb"] <= 1.0, "xgb consistency must be in [0, 1]"
+
+        # Check reliability values
+        assert "reliability" in result, "reliability dict must be in fusion result"
+        assert "xgb" in result["reliability"], "xgb reliability must be present"
+        assert 0.0 <= result["reliability"]["xgb"] <= 1.0, "xgb reliability must be in [0, 1]"
+
+    def test_c23_result_dict_exposes_fusion_metadata(self):
+        """C23: Fusion result dict exposes weights, scores, and component tracking."""
+        from fusion.fusion_engine import FusionEngine
+
+        fe = FusionEngine(threshold=0.5)
+        result = fe.fuse(xgb_score=0.8, ae_score=0.4)
+
+        # FusionEngine.fuse() returns 'weights' and 'scores' (inference.py wraps as fusion_*)
+        assert "weights" in result, "weights must be in fusion result"
+        assert "scores" in result, "scores must be in fusion result"
+        assert "available_components" in result, "available_components must be in fusion result"
+        assert "missing_components" in result, "missing_components must be in fusion result"
+
+        # Verify structure
+        assert isinstance(result["weights"], dict), "weights must be a dict"
+        assert isinstance(result["scores"], dict), "scores must be a dict"
+        assert isinstance(result["available_components"], list), "available_components must be a list"
+        assert isinstance(result["missing_components"], list), "missing_components must be a list"
+
+    def test_c24_entropy_calculations_correct(self):
+        """C24: Entropy calculations produce correct values (H(0.5)=1.0, H(0)/H(1)=0.0)."""
+        from fusion.fusion_engine import calculate_entropy, calculate_normalized_entropy, calculate_confidence
+
+        # H(0.5) = 1.0 (maximum uncertainty)
+        h_05 = calculate_entropy(0.5)
+        assert abs(h_05 - 1.0) < 1e-10, f"H(0.5) = {h_05}, expected 1.0"
+
+        # H(0) = 0 and H(1) = 0 (certainty)
+        h_0 = calculate_entropy(0.0)
+        h_1 = calculate_entropy(1.0)
+        assert h_0 == 0.0, f"H(0.0) = {h_0}, expected 0.0"
+        assert h_1 == 0.0, f"H(1.0) = {h_1}, expected 0.0"
+
+        # Normalized entropy same as binary entropy (log2(2) = 1)
+        nh_05 = calculate_normalized_entropy(0.5)
+        assert abs(nh_05 - 1.0) < 1e-10, f"H_norm(0.5) = {nh_05}, expected 1.0"
+
+        # Confidence: C = 1 - H_norm
+        # C(0.5) = 0 (low confidence at maximum uncertainty)
+        c_05 = calculate_confidence(0.5)
+        assert abs(c_05 - 0.0) < 1e-10, f"C(0.5) = {c_05}, expected 0.0"
+
+        # C(0.0) = 1 and C(1.0) = 1 (high certainty)
+        c_0 = calculate_confidence(0.0)
+        c_1 = calculate_confidence(1.0)
+        assert abs(c_0 - 1.0) < 1e-10, f"C(0.0) = {c_0}, expected 1.0"
+        assert abs(c_1 - 1.0) < 1e-10, f"C(1.0) = {c_1}, expected 1.0"
+
+    def test_c25_consistency_boundaries(self):
+        """C25: Consistency is bounded in [0, 1] and handles edge cases."""
+        from fusion.fusion_engine import calculate_consistency
+
+        # When score equals mean, consistency = 1.0
+        c = calculate_consistency(0.5, [0.5, 0.5])
+        assert c == 1.0, f"Consistency when score=mean should be 1.0, got {c}"
+
+        # When scores are all identical, consistency = 1.0
+        c = calculate_consistency(0.5, [0.5, 0.5])
+        assert c == 1.0, f"Consistency with identical scores should be 1.0, got {c}"
+
+        # Consistency stays in [0, 1]
+        c = calculate_consistency(0.8, [0.2, 0.5])
+        assert 0.0 <= c <= 1.0, f"Consistency {c} out of [0, 1]"
+
+        # Single other score
+        c = calculate_consistency(0.5, [0.3])
+        assert 0.0 <= c <= 1.0, f"Consistency with single other score should be in [0, 1], got {c}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Extended C13 — No RF keys in inference output (with fusion metadata)
+# ─────────────────────────────────────────────────────────────────────────────

@@ -135,6 +135,15 @@ def _resolve_scapy_iface(selected: Optional[str]):
     if selected is None:
         return None
 
+    try:
+        from scapy.all import conf
+        dev = conf.ifaces.dev_from_name(selected)
+        if dev is not None and not isinstance(dev, str):
+            logger.info("Interface '%s' resolved → Scapy NetworkInterface object '%s'", selected, dev)
+            return dev
+    except Exception as exc:
+        logger.debug("conf.ifaces.dev_from_name failed for '%s': %s", selected, exc)
+
     raw = _get_scapy_ifaces_list()
     for _i, iface_obj, desc in raw:
         if isinstance(iface_obj, str):
