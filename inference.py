@@ -3,30 +3,23 @@ inference.py
 ============
 AI-Powered Network Traffic Analyzer — INFERENCE ENGINE
 
-Active detection architecture (Phase 2):
-    LIVE FLOW -> 49 FEATURES -> XGBoost + Autoencoder -> Fusion Engine -> Dashboard
+Active detection architecture (Full):
+    LIVE FLOW -> 49 FEATURES -> XGBoost + Autoencoder + GNN -> Fusion Engine -> Dashboard
 
 This module:
-  - Loads XGBoost, Autoencoder, and Scaler artifacts from models/
+  - Loads XGBoost, Autoencoder, Scaler, GNN artifacts from models/
   - Validates the canonical 49-feature schema on every flow
-  - Runs XGBoost and AE inference
-  - Produces normalized scores for the Fusion Engine
-  - Returns a structured result dict with fusion output
-
-NOTE: Random Forest has been removed from the active pipeline.
-      rf_model.pkl is retained as a LEGACY BASELINE artifact only.
-      The active supervised model is XGBoost (xgb_model.pkl).
-
-GNN and Temporal scores are not yet available (Person 1 integration pending).
-The fusion engine operates in PARTIAL mode (XGB + AE only) until they are
-integrated. gnn_score and temporal_score are always None in this version.
+  - Runs XGBoost, AE, and GNN (OnlineGraphStream) inference
+  - Extracts enriched behavioral features (IAT, TCP flags, payload stats)
+  - Produces normalized scores for the Dynamic Fusion Engine
+  - Returns a structured result dict with full fusion output
 
 Feature schema is imported from feature_schema.py — single canonical source.
 Missing features raise ValueError — they are NEVER silently fabricated.
 
 Usage:
     from inference import engine
-    engine.load()        # load AE + Scaler + XGBoost
+    engine.load()        # load AE + Scaler + XGBoost + GNN
     result = engine.run_inference(feature_dict)
 """
 
@@ -40,15 +33,18 @@ import numpy as np
 
 from feature_schema import FEATURE_COLS
 from fusion.fusion_engine import FusionEngine, load_fusion_threshold
+from features.enriched_features import extract_from_dataset_record, ENRICHED_FEATURE_KEYS
 
 logger = logging.getLogger(__name__)
 
-_MODELS_DIR   = os.path.join(os.path.dirname(__file__), "models")
-_AE_PATH      = os.path.join(_MODELS_DIR, "ae_model.keras")
-_SCALER_PATH  = os.path.join(_MODELS_DIR, "scaler.pkl")
-_ART_PATH     = os.path.join(_MODELS_DIR, "artifacts.json")    # AE threshold + mse_max
-_XGB_PATH     = os.path.join(_MODELS_DIR, "xgb_model.pkl")
-_XGB_ART_PATH = os.path.join(_MODELS_DIR, "xgb_artifacts.json")
+_MODELS_DIR    = os.path.join(os.path.dirname(__file__), "models")
+_AE_PATH       = os.path.join(_MODELS_DIR, "ae_model.keras")
+_SCALER_PATH   = os.path.join(_MODELS_DIR, "scaler.pkl")
+_ART_PATH      = os.path.join(_MODELS_DIR, "artifacts.json")    # AE threshold + mse_max
+_XGB_PATH      = os.path.join(_MODELS_DIR, "xgb_model.pkl")
+_XGB_ART_PATH  = os.path.join(_MODELS_DIR, "xgb_artifacts.json")
+_GNN_MODEL_PATH   = os.path.join(os.path.dirname(__file__), "dynamic_temporal_gnn.pt")
+_GNN_SCALERS_PATH = os.path.join(os.path.dirname(__file__), "gnn_scalers.pkl")
 
 
 class InferenceEngine:
@@ -73,6 +69,10 @@ class InferenceEngine:
         self._xgb           = None
         self._xgb_attack_idx = None
 
+        # ── GNN (OnlineGraphStream) ───────────────────────────────────────────
+        self._gnn_stream    = None   # OnlineGraphStream instance
+        self._gnn_loaded    = False
+
         # ── Fusion ───────────────────────────────────────────────────────────
         self._fusion        = None
 
@@ -83,7 +83,7 @@ class InferenceEngine:
 
     def load(self):
         """
-        Load AE + Scaler + XGBoost artifacts from disk.
+        Load AE + Scaler + XGBoost + GNN artifacts from disk.
 
         Required files:
             models/ae_model.keras
@@ -91,6 +91,10 @@ class InferenceEngine:
             models/artifacts.json     (AE threshold)
             models/xgb_model.pkl
             models/xgb_artifacts.json (xgb_ae_mse_max for leakage-free AE normalization)
+
+        Optional (GNN branch — graceful degradation if missing):
+            dynamic_temporal_gnn.pt
+            gnn_scalers.pkl
 
         Raises FileNotFoundError if any required artifact is missing.
         """
@@ -145,13 +149,51 @@ class InferenceEngine:
                 "Using feature_schema.py as authoritative source."
             )
 
-        # Use the leakage-free xgb_ae_mse_max (derived from validation split,
-        # NOT from the test set) for normalizing AE scores in the fusion layer.
         self._ae_mse_max = float(xgb_art["xgb_ae_mse_max"])
 
         classes = list(self._xgb.classes_)
         self._xgb_attack_idx = int(classes.index(1))
         self._xgb_loaded = True
+
+        # ── GNN (OnlineGraphStream) — optional, graceful degradation ─────────
+        if os.path.exists(_GNN_MODEL_PATH) and os.path.exists(_GNN_SCALERS_PATH):
+            try:
+                import torch
+                from gnn.dynamic_temporal_gnn import DynamicBipartiteTemporalGNN
+                from gnn.online_graph_stream import OnlineGraphStream
+
+                logger.info("Loading GNN model from %s ...", _GNN_MODEL_PATH)
+                gnn_model = DynamicBipartiteTemporalGNN(
+                    host_dim=8, service_dim=8, edge_dim=9, hidden_dim=32
+                )
+                state_dict = torch.load(
+                    _GNN_MODEL_PATH, map_location="cpu", weights_only=False
+                )
+                gnn_model.load_state_dict(state_dict)
+                gnn_model.eval()
+
+                logger.info("Loading GNN scalers from %s ...", _GNN_SCALERS_PATH)
+                gnn_scalers = joblib.load(_GNN_SCALERS_PATH)
+
+                self._gnn_stream = OnlineGraphStream(
+                    gnn_model=gnn_model,
+                    scalers=gnn_scalers,
+                    window_size=500,
+                    mode="live_capture",
+                )
+                self._gnn_loaded = True
+                logger.info("GNN OnlineGraphStream ready (window_size=500).")
+            except Exception as exc:
+                logger.warning(
+                    "GNN loading failed — running in partial mode (XGB+AE only): %s", exc
+                )
+                self._gnn_loaded = False
+        else:
+            logger.info(
+                "GNN artifacts not found at expected paths — "
+                "running in partial mode (XGB+AE only)."
+            )
+            self._gnn_loaded = False
 
         # ── Fusion engine ────────────────────────────────────────────────────
         threshold = load_fusion_threshold()
@@ -159,8 +201,9 @@ class InferenceEngine:
 
         self._loaded = True
         logger.info(
-            "Inference engine ready. "
+            "Inference engine ready. GNN=%s  "
             "AE threshold=%.6f  ae_mse_max=%.6f (leakage-free)",
+            "ACTIVE" if self._gnn_loaded else "DISABLED (partial mode)",
             self._ae_threshold, self._ae_mse_max,
         )
 
@@ -244,14 +287,61 @@ class InferenceEngine:
         # Clipped to [0, 1] for fusion. Raw ae_mse is also reported separately.
         ae_score = float(min(ae_mse / (self._ae_mse_max + 1e-9), 1.0))
 
+        # ── Enriched features (IAT, TCP flags, payload stats) ─────────────────
+        enriched = extract_from_dataset_record(feature_dict)
+
+        # ── GNN inference via OnlineGraphStream ───────────────────────────────
+        gnn_score_val    = None
+        temporal_score_val = None
+        gnn_latency_ms   = 0.0
+
+        if self._gnn_loaded and self._gnn_stream is not None:
+            try:
+                # Build a minimal flow_rec for the graph stream
+                _flow_rec = {
+                    "src_ip"      : feature_dict.get("_src_ip", "0.0.0.0"),
+                    "dst_ip"      : feature_dict.get("_dst_ip", "0.0.0.0"),
+                    "dst_port"    : feature_dict.get("_dst_port", 0),
+                    "protocol"    : feature_dict.get("_protocol", "TCP"),
+                    "timestamp"   : feature_dict.get("_timestamp", time.time()),
+                    "byte_count"  : feature_dict.get("_byte_count", 0),
+                    "pkt_count"   : feature_dict.get("_pkt_count", 0),
+                    "duration"    : feature_dict.get("_duration", 0.0),
+                    "xgb_prob"    : xgb_prob,
+                    "ae_score"    : ae_score,
+                    "fusion_score": 0.0,   # placeholder — fusion not yet computed
+                    "attack_label": 0,
+                }
+                self._gnn_stream.ingest_flow(_flow_rec)
+
+                # Only evaluate when we have enough flows for a meaningful graph
+                if self._gnn_stream.buffer_size >= 2:
+                    from graph.gnn_output import GNNOutputRecord
+                    t_gnn = time.perf_counter()
+                    probs, temporal_shift, _pyg, _hm, _sm, gnn_lat = \
+                        self._gnn_stream.evaluate_realtime_gnn_risk()
+                    gnn_latency_ms = gnn_lat
+
+                    if probs is not None and len(probs) > 0:
+                        gnn_out = GNNOutputRecord.from_stream_output(
+                            flow_id=f"{_flow_rec['src_ip']}:{_flow_rec['dst_port']}",
+                            probs=probs,
+                            gnn_latency_ms=gnn_lat,
+                            stream=self._gnn_stream,
+                            edge_idx=-1,
+                            temporal_shift=temporal_shift,
+                        )
+                        gnn_score_val    = gnn_out.gnn_score
+                        temporal_score_val = gnn_out.temporal_score
+            except Exception as exc:
+                logger.debug("GNN inference error (non-fatal): %s", exc)
+
         # ── Fusion ────────────────────────────────────────────────────────────
-        # gnn_score and temporal_score are None until Person 1 integration.
-        # DO NOT pass fabricated values here.
         fusion_result = self._fusion.fuse(
             xgb_score=xgb_prob,
             ae_score=ae_score,
-            gnn_score=None,       # Will be populated by Person 1's GNN when available
-            temporal_score=None,  # Will be populated by Temporal component when available
+            gnn_score=gnn_score_val,
+            temporal_score=temporal_score_val,
         )
 
         t_end = time.perf_counter()
@@ -281,9 +371,10 @@ class InferenceEngine:
             "ae_mse"     : round(ae_mse, 6),
             "ae_score"   : round(ae_score, 6),    # normalized [0,1]
             "ae_pred"    : ae_pred,
-            # ── GNN / Temporal (from Person 1 integration when available) ────
+            # ── GNN / Temporal ────────────────────────────────────────────────
             "gnn_score"      : fusion_result.get("scores", {}).get("gnn"),
             "temporal_score" : fusion_result.get("scores", {}).get("temporal"),
+            "gnn_latency_ms" : round(gnn_latency_ms, 3),
             # ── Fusion ───────────────────────────────────────────────────────
             "fusion_score" : fusion_result["fusion_score"],
             "fusion_pred"  : fusion_result["fusion_prediction"],
@@ -295,6 +386,8 @@ class InferenceEngine:
             "fusion_reliability": fusion_result.get("reliability", {}),
             "available_components": fusion_result.get("available_components", []),
             "missing_components": fusion_result.get("missing_components", []),
+            # ── Enriched behavioral features ─────────────────────────────────
+            "enriched"       : enriched,
             # ── Performance ──────────────────────────────────────────────────
             "inference_latency_ms": latency_ms,
         }

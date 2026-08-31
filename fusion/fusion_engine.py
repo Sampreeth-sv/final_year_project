@@ -26,7 +26,11 @@ logger = logging.getLogger(__name__)
 
 # Default configuration
 _DEFAULT_THRESHOLD = 0.5
-_TEMPORAL_NORMALIZATION_FACTOR = 100.0  # Scale factor for GRU norm -> [0,1]
+# Temporal normalization factor fallback (only used if fusion_config.json
+# does not contain a calibrated temporal_max_norm). The actual value used
+# at runtime is loaded from models/fusion_config.json, which is calibrated
+# from validation data by calibrate_temporal_norm.py.
+_DEFAULT_TEMPORAL_MAX_NORM = 100.0
 
 # Config path
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -68,11 +72,57 @@ def load_fusion_threshold(config_path: str = _FUSION_CFG_PATH) -> float:
     return _DEFAULT_THRESHOLD
 
 
+def load_temporal_max_norm(config_path: str = _FUSION_CFG_PATH) -> float:
+    """
+    Load the calibrated temporal_max_norm from fusion_config.json.
+
+    This value is the 95th percentile of GRU hidden-state L2 norms computed
+    from the validation set by calibrate_temporal_norm.py. It is used by
+    normalize_temporal_score() to map raw L2 norms into [0, 1].
+
+    Falls back to _DEFAULT_TEMPORAL_MAX_NORM (100.0) only if the config file
+    does not exist or the key is missing.
+
+    Parameters
+    ----------
+    config_path : str
+        Path to the fusion configuration JSON file
+
+    Returns
+    -------
+    float
+        The calibrated temporal_max_norm
+    """
+    if os.path.exists(config_path):
+        try:
+            with open(config_path) as f:
+                cfg = json.load(f)
+            max_norm = float(cfg.get("temporal_max_norm", _DEFAULT_TEMPORAL_MAX_NORM))
+            logger.info(
+                "Temporal max_norm loaded from config: %.6f (calibrated from validation data)",
+                max_norm,
+            )
+            return max_norm
+        except Exception as exc:
+            logger.warning(
+                "Could not read temporal_max_norm from fusion_config.json (%s) — "
+                "using default %.2f",
+                exc, _DEFAULT_TEMPORAL_MAX_NORM,
+            )
+    else:
+        logger.info(
+            "fusion_config.json not found at %s — using default temporal max_norm %.2f. "
+            "Run calibrate_temporal_norm.py to derive a data-driven value.",
+            config_path, _DEFAULT_TEMPORAL_MAX_NORM,
+        )
+    return _DEFAULT_TEMPORAL_MAX_NORM
+
+
 # =============================================================================
 # SCORE NORMALIZATION
 # =============================================================================
 
-def normalize_temporal_score(raw_norm: float, max_norm: float = 100.0) -> float:
+def normalize_temporal_score(raw_norm: float, max_norm: Optional[float] = None) -> float:
     """
     Normalize raw GRU hidden state L2 norm to [0, 1].
 
@@ -88,20 +138,28 @@ def normalize_temporal_score(raw_norm: float, max_norm: float = 100.0) -> float:
         - norm ≈ max_norm/2 → score ≈ 0.5 (neutral)
         - norm ≈ max_norm → score ≈ 0.993 (essentially 1)
 
-    Higher values = higher temporal activity = higher risk.
+    CALIBRATION: max_norm is loaded from models/fusion_config.json, which
+    is the 95th percentile of temporal norms computed from the validation
+    set by calibrate_temporal_norm.py. The fallback default is 100.0, but
+    this only applies if the config file is missing or has no
+    temporal_max_norm key.
 
     Parameters
     ----------
     raw_norm : float
         Raw L2 norm of GRU hidden state
-    max_norm : float
-        Expected maximum norm for scaling (default 100.0)
+    max_norm : float, optional
+        Expected maximum norm for scaling. If None, loaded from
+        models/fusion_config.json. Default None (load from config).
 
     Returns
     -------
     float
         Normalized temporal score in [0, 1]
     """
+    if max_norm is None:
+        max_norm = load_temporal_max_norm()
+
     norm = max(0.0, raw_norm)
     # Sigmoid centered at max_norm/2 with steepness k = 4/max_norm
     k = 4.0 / max(max_norm, 1e-6)

@@ -659,6 +659,33 @@ class TestArtifacts:
         assert "fusion_threshold" in cfg
         assert 0.0 < cfg["fusion_threshold"] <= 1.0
 
+    def test_temporal_max_norm_is_calibrated(self):
+        """temporal_max_norm must be present and > 0 in fusion_config.json.
+
+        This value is calibrated from validation data by calibrate_temporal_norm.py.
+        It must NOT be the hardcoded default of 100.0 — the calibration script
+        must have been run to produce a data-driven value.
+        """
+        cfg_path = os.path.join(MODELS_DIR, "fusion_config.json")
+        assert os.path.exists(cfg_path), "fusion_config.json not found"
+
+        with open(cfg_path) as f:
+            cfg = json.load(f)
+
+        assert "temporal_max_norm" in cfg, (
+            "fusion_config.json must contain temporal_max_norm. "
+            "Run calibrate_temporal_norm.py to derive it from validation data."
+        )
+        max_norm = cfg["temporal_max_norm"]
+        assert max_norm > 0.0, f"temporal_max_norm must be > 0, got {max_norm}"
+
+        # The calibrated value should NOT be the hardcoded default of 100.0
+        # (unless validation data actually produces 100.0 as its 95th percentile)
+        assert max_norm < 100.0, (
+            f"temporal_max_norm={max_norm} equals the hardcoded default of 100.0. "
+            "Run calibrate_temporal_norm.py to derive a data-driven value from validation data."
+        )
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # NEW: Dynamic Fusion Engine Tests (C17-C25)
@@ -928,6 +955,453 @@ class TestDynamicFusion:
         # Single other score
         c = calculate_consistency(0.5, [0.3])
         assert 0.0 <= c <= 1.0, f"Consistency with single other score should be in [0, 1], got {c}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Temporal Normalization Calibration Tests (C26-C28)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestTemporalCalibration:
+
+    def test_c26_load_temporal_max_norm_from_config(self):
+        """C26: load_temporal_max_norm() returns the calibrated value from fusion_config.json."""
+        from fusion.fusion_engine import load_temporal_max_norm
+
+        max_norm = load_temporal_max_norm()
+
+        # Must be positive
+        assert max_norm > 0.0, f"temporal_max_norm must be > 0, got {max_norm}"
+        # Must NOT be the hardcoded default of 100.0
+        assert max_norm < 100.0, (
+            f"temporal_max_norm={max_norm} equals hardcoded default of 100.0. "
+            "calibrate_temporal_norm.py must be run to produce a data-driven value."
+        )
+
+    def test_c27_normalize_temporal_uses_calibrated_value(self):
+        """C27: normalize_temporal_score() uses the calibrated max_norm by default."""
+        from fusion.fusion_engine import normalize_temporal_score, load_temporal_max_norm
+
+        calibrated = load_temporal_max_norm()
+
+        # When called without explicit max_norm, must use calibrated value
+        # Feed a value at the calibrated max_norm and verify the output
+        normalized_at_max = normalize_temporal_score(calibrated)
+
+        # S(max_norm) = 1/(1+exp(-2)) ≈ 0.8808 with calibrated max_norm
+        assert 0.8 < normalized_at_max < 0.95, (
+            f"normalize_temporal_score(max_norm) should map to ~0.88, got {normalized_at_max}"
+        )
+
+        # Verify output is bounded in [0, 1]
+        normalized_at_zero = normalize_temporal_score(0.0)
+        assert 0.0 <= normalized_at_zero <= 1.0, (
+            f"normalize_temporal_score(0) should be in [0,1], got {normalized_at_zero}"
+        )
+        # With calibrated max_norm ≈ 26, norm=0 is below the midpoint (x0≈13),
+        # so sigmoid(0) ≈ 0.119, correctly below the 0.5 neutral point
+        assert normalized_at_zero < 0.5, (
+            f"normalize_temporal_score(0) should be below midpoint 0.5, got {normalized_at_zero}"
+        )
+
+    def test_c28_full_fusion_with_temporal_uses_calibrated_normalization(self):
+        """C28: Full fusion (XGB+AE+GNN+Temporal) normalizes temporal with calibrated max_norm."""
+        from fusion.fusion_engine import FusionEngine, normalize_temporal_score, load_temporal_max_norm
+        import json
+
+        # Get the calibrated value
+        calibrated = load_temporal_max_norm()
+
+        # Verify it's in the config
+        cfg_path = os.path.join(MODELS_DIR, "fusion_config.json")
+        with open(cfg_path) as f:
+            cfg = json.load(f)
+        assert "temporal_max_norm" in cfg, "temporal_max_norm must be in fusion_config.json"
+        assert abs(cfg["temporal_max_norm"] - calibrated) < 1e-9, (
+            "Config temporal_max_norm must match load_temporal_max_norm() result"
+        )
+
+        # Run full fusion with a typical temporal score
+        fe = FusionEngine(threshold=0.5)
+        # Use a temporal score near the calibrated max_norm
+        # This should normalize to ~0.88 with calibrated max_norm
+        temporal_raw = calibrated * 0.95  # Below max_norm
+
+        result = fe.fuse(
+            xgb_score=0.8,
+            ae_score=0.4,
+            gnn_score=0.7,
+            temporal_score=temporal_raw,  # > 1.0, will be normalized
+        )
+
+        # Verify fusion mode is "full"
+        assert result["fusion_mode"] == "full", (
+            f"Expected fusion_mode='full', got '{result['fusion_mode']}'"
+        )
+
+        # Verify all four weights are present and sum to 1.0
+        weights = result["weights"]
+        assert weights["xgb"] is not None
+        assert weights["ae"] is not None
+        assert weights["gnn"] is not None
+        assert weights["temporal"] is not None
+
+        w_total = weights["xgb"] + weights["ae"] + weights["gnn"] + weights["temporal"]
+        assert abs(w_total - 1.0) < 1e-6, f"Full weights sum to {w_total}, expected 1.0"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Enriched Feature Tests (E1–E25)
+# ─────────────────────────────────────────────────────────────────────────────
+
+import math as _math
+
+
+class TestEnrichedFeatures:
+
+    # ── IAT tests ────────────────────────────────────────────────────────────
+
+    def test_e1_iat_calculation_known_timestamps(self):
+        """E1: IAT mean is correct for known timestamp intervals."""
+        from features.enriched_features import _compute_iat_stats
+
+        # Simulate 4 IAT values: 0.1, 0.2, 0.3, 0.4 seconds
+        iat = [0.1, 0.2, 0.3, 0.4]
+        stats = _compute_iat_stats(iat)
+
+        # Mean: (0.1+0.2+0.3+0.4)/4 = 0.25 s
+        # Median: (0.2+0.3)/2 = 0.25 s → 250 ms
+        assert abs(stats["iat_median_ms"] - 250.0) < 1e-6, (
+            f"iat_median_ms={stats['iat_median_ms']}, expected 250.0"
+        )
+        assert stats["iat_count"] == 4, f"Expected count 4, got {stats['iat_count']}"
+
+    def test_e2_iat_median_single_value(self):
+        """E2: IAT median is correct with a single value."""
+        from features.enriched_features import _compute_iat_stats
+
+        stats = _compute_iat_stats([0.5])
+        assert abs(stats["iat_median_ms"] - 500.0) < 1e-6, (
+            f"iat_median_ms={stats['iat_median_ms']}, expected 500.0"
+        )
+
+    def test_e3_iat_empty_list_returns_zero(self):
+        """E3: IAT stats return 0 for empty list."""
+        from features.enriched_features import _compute_iat_stats
+
+        stats = _compute_iat_stats([])
+        assert stats["iat_median_ms"] == 0.0
+        assert stats["iat_count"] == 0
+
+    def test_e4_iat_converts_seconds_to_ms(self):
+        """E4: IAT stats are converted from seconds to milliseconds."""
+        from features.enriched_features import _compute_iat_stats
+
+        # 0.001 s = 1 ms
+        stats = _compute_iat_stats([0.001, 0.002, 0.003])
+        assert abs(stats["iat_median_ms"] - 2.0) < 1e-6, (
+            f"iat_median_ms={stats['iat_median_ms']}, expected 2.0 ms"
+        )
+
+    def test_e5_iat_extract_from_flow_record(self):
+        """E5: IAT median is correctly extracted from a _FlowRecord."""
+        from features.enriched_features import extract_from_flow_record
+        from flow_extractor import _FlowRecord
+
+        flow = _FlowRecord(
+            src_ip="1.1.1.1", dst_ip="2.2.2.2",
+            src_port=12345, dst_port=80,
+            protocol=6, now=0.0,
+        )
+        flow.iat_in  = [0.1, 0.2, 0.3]
+        flow.iat_out = [0.05, 0.15]
+        # iat_median = median of [0.1, 0.2, 0.3, 0.05, 0.15] sorted = [0.05, 0.1, 0.15, 0.2, 0.3] = 0.15 s = 150 ms
+
+        feat = extract_from_flow_record(flow)
+        assert abs(feat["iat_median_ms"] - 150.0) < 1e-6
+        assert feat["iat_count_in"] == 3
+        assert feat["iat_count_out"] == 2
+        assert feat["iat_count_total"] == 5
+
+    # ── TCP flag tests ────────────────────────────────────────────────────────
+
+    def test_e6_tcp_syn_flag(self):
+        """E6: TCP SYN flag is correctly extracted from bitmask."""
+        from features.enriched_features import _flags_from_bitmask
+
+        # SYN = 0x02
+        assert _flags_from_bitmask(0x02)["TCP_SYN"] == 1.0
+        assert _flags_from_bitmask(0x00)["TCP_SYN"] == 0.0
+        assert _flags_from_bitmask(0x12)["TCP_SYN"] == 1.0   # SYN+ACK
+
+    def test_e7_tcp_ack_flag(self):
+        """E7: TCP ACK flag is correctly extracted from bitmask."""
+        from features.enriched_features import _flags_from_bitmask
+
+        # ACK = 0x10
+        assert _flags_from_bitmask(0x10)["TCP_ACK"] == 1.0
+        assert _flags_from_bitmask(0x00)["TCP_ACK"] == 0.0
+        assert _flags_from_bitmask(0x12)["TCP_ACK"] == 1.0   # SYN+ACK
+
+    def test_e8_tcp_fin_flag(self):
+        """E8: TCP FIN flag is correctly extracted from bitmask."""
+        from features.enriched_features import _flags_from_bitmask
+
+        # FIN = 0x01
+        assert _flags_from_bitmask(0x01)["TCP_FIN"] == 1.0
+        assert _flags_from_bitmask(0x00)["TCP_FIN"] == 0.0
+        assert _flags_from_bitmask(0x11)["TCP_FIN"] == 1.0   # FIN+ACK
+
+    def test_e9_tcp_rst_flag(self):
+        """E9: TCP RST flag is correctly extracted from bitmask."""
+        from features.enriched_features import _flags_from_bitmask
+
+        # RST = 0x04
+        assert _flags_from_bitmask(0x04)["TCP_RST"] == 1.0
+        assert _flags_from_bitmask(0x00)["TCP_RST"] == 0.0
+        assert _flags_from_bitmask(0x14)["TCP_RST"] == 1.0   # RST+ACK
+
+    def test_e10_tcp_psh_flag(self):
+        """E10: TCP PSH flag is correctly extracted from bitmask."""
+        from features.enriched_features import _flags_from_bitmask
+
+        # PSH = 0x08
+        assert _flags_from_bitmask(0x08)["TCP_PSH"] == 1.0
+        assert _flags_from_bitmask(0x00)["TCP_PSH"] == 0.0
+        assert _flags_from_bitmask(0x18)["TCP_PSH"] == 1.0   # PSH+ACK
+
+    def test_e11_tcp_urg_flag(self):
+        """E11: TCP URG flag is correctly extracted from bitmask."""
+        from features.enriched_features import _flags_from_bitmask
+
+        # URG = 0x20
+        assert _flags_from_bitmask(0x20)["TCP_URG"] == 1.0
+        assert _flags_from_bitmask(0x00)["TCP_URG"] == 0.0
+        assert _flags_from_bitmask(0x30)["TCP_URG"] == 1.0   # URG+PSH
+
+    def test_e12_tcp_combined_flags(self):
+        """E12: TCP flag bitmask correctly extracts multiple flags simultaneously."""
+        from features.enriched_features import _flags_from_bitmask
+
+        # SYN+ACK = 0x12
+        flags = _flags_from_bitmask(0x12)
+        assert flags["TCP_SYN"] == 1.0
+        assert flags["TCP_ACK"] == 1.0
+        assert flags["TCP_FIN"] == 0.0
+        assert flags["TCP_RST"] == 0.0
+        assert flags["TCP_PSH"] == 0.0
+        assert flags["TCP_URG"] == 0.0
+
+    def test_e13_tcp_flag_extract_from_flow_record(self):
+        """E13: TCP flags are correctly extracted from _FlowRecord."""
+        from features.enriched_features import extract_from_flow_record
+        from flow_extractor import _FlowRecord
+
+        flow = _FlowRecord(
+            src_ip="1.1.1.1", dst_ip="2.2.2.2",
+            src_port=12345, dst_port=80,
+            protocol=6, now=0.0,
+        )
+        flow.tcp_flags_all = 0x12   # SYN+ACK
+
+        feat = extract_from_flow_record(flow)
+        assert feat["tcp_syn"] == 1.0
+        assert feat["tcp_ack"] == 1.0
+        assert feat["tcp_fin"] == 0.0
+        assert feat["tcp_rst"] == 0.0
+        assert feat["tcp_flag_mask"] == 0x12
+
+    # ── Payload statistics tests ───────────────────────────────────────────────
+
+    def test_e14_payload_mean(self):
+        """E14: Payload mean is correctly computed."""
+        from features.enriched_features import _compute_payload_stats
+
+        lengths = [100, 200, 300]
+        stats = _compute_payload_stats(lengths)
+        assert abs(stats["payload_mean"] - 200.0) < 1e-6
+
+    def test_e15_payload_std(self):
+        """E15: Payload standard deviation is correctly computed (population std)."""
+        from features.enriched_features import _compute_payload_stats
+
+        # [0, 100, 200]: mean=100, var=20000/3, std=sqrt(20000/3) ≈ 81.65
+        stats = _compute_payload_stats([0.0, 100.0, 200.0])
+        expected_std = _math.sqrt(20000.0 / 3.0)  # population std ≈ 81.65
+        assert abs(stats["payload_std"] - expected_std) < 1e-6
+
+    def test_e16_payload_min_max(self):
+        """E16: Payload statistics include min and max packet length."""
+        from features.enriched_features import _compute_payload_stats
+
+        lengths = [50, 100, 200, 1500]
+        stats = _compute_payload_stats(lengths)
+        # median of [50, 100, 200, 1500] = (100+200)/2 = 150
+        assert abs(stats["payload_median"] - 150.0) < 1e-6
+        # mean = (50+100+200+1500)/4 = 1850/4 = 462.5
+        assert abs(stats["payload_mean"] - 462.5) < 1e-6
+
+    def test_e17_payload_variance(self):
+        """E17: Payload variance is correctly computed (population variance)."""
+        from features.enriched_features import _compute_payload_stats
+
+        # [0, 100, 200]: mean=100, var=((0-100)^2 + (100-100)^2 + (200-100)^2)/3 = 20000/3
+        stats = _compute_payload_stats([0.0, 100.0, 200.0])
+        expected_var = 20000.0 / 3.0
+        assert abs(stats["payload_var"] - expected_var) < 1e-6
+
+    def test_e18_payload_empty_returns_zeros(self):
+        """E18: Payload stats return 0.0 for empty packet list."""
+        from features.enriched_features import _compute_payload_stats
+
+        stats = _compute_payload_stats([])
+        assert stats["payload_mean"] == 0.0
+        assert stats["payload_std"] == 0.0
+        assert stats["payload_var"] == 0.0
+        assert stats["payload_median"] == 0.0
+        assert stats["payload_entropy"] == 0.0
+
+    def test_e19_payload_single_packet_returns_zero_std(self):
+        """E19: Payload std/var is 0.0 for a single-packet flow."""
+        from features.enriched_features import _compute_payload_stats
+
+        stats = _compute_payload_stats([500])
+        assert stats["payload_mean"] == 500.0
+        assert stats["payload_std"] == 0.0
+        assert stats["payload_var"] == 0.0
+
+    def test_e20_payload_extract_from_flow_record(self):
+        """E20: Payload stats are correctly extracted from _FlowRecord."""
+        from features.enriched_features import extract_from_flow_record
+        from flow_extractor import _FlowRecord
+
+        flow = _FlowRecord(
+            src_ip="1.1.1.1", dst_ip="2.2.2.2",
+            src_port=12345, dst_port=80,
+            protocol=6, now=0.0,
+        )
+        # Simulate packets: lengths are added in _process via pkt_lengths.append(ip_len)
+        # We add directly for testing
+        flow.pkt_lengths = [100, 200, 300, 400]
+
+        feat = extract_from_flow_record(flow)
+        assert abs(feat["payload_mean"] - 250.0) < 1e-6
+        assert feat["payload_entropy"] > 0.0  # non-uniform distribution
+
+    # ── Dataset path tests ──────────────────────────────────────────────────────
+
+    def test_e21_dataset_extract_tcp_flags(self):
+        """E21: Dataset record TCP flags are correctly extracted from bitmask."""
+        from features.enriched_features import extract_from_dataset_record
+
+        record = {"TCP_FLAGS": 0x12, "CLIENT_TCP_FLAGS": 0x02, "SERVER_TCP_FLAGS": 0x10}
+        feat = extract_from_dataset_record(record)
+        assert feat["tcp_syn"] == 1.0
+        assert feat["tcp_ack"] == 1.0
+        assert feat["tcp_client_flags"] == 0x02
+        assert feat["tcp_server_flags"] == 0x10
+
+    def test_e22_dataset_extract_payload_from_buckets(self):
+        """E22: Dataset payload stats are derived from bucket features."""
+        from features.enriched_features import extract_from_dataset_record
+
+        # 5 packets: 2 in [0-128], 1 in [128-256], 2 in [512-1024]
+        record = {
+            "NUM_PKTS_UP_TO_128_BYTES": 2,
+            "NUM_PKTS_128_TO_256_BYTES": 1,
+            "NUM_PKTS_256_TO_512_BYTES": 0,
+            "NUM_PKTS_512_TO_1024_BYTES": 2,
+            "NUM_PKTS_1024_TO_1514_BYTES": 0,
+        }
+        feat = extract_from_dataset_record(record)
+        # Reconstructed: [64]*2 + [192]*1 + [768]*2
+        # mean = (128+192+1536)/5 = 371.2
+        assert abs(feat["payload_mean"] - 371.2) < 1.0  # approx midpoint
+        assert feat["payload_entropy"] > 0.0
+
+    def test_e23_dataset_iat_median_unavailable(self):
+        """E23: IAT median is None for dataset records (per-packet data unavailable)."""
+        from features.enriched_features import extract_from_dataset_record
+
+        record = {
+            "SRC_TO_DST_IAT_MIN": 1.0,
+            "SRC_TO_DST_IAT_MAX": 10.0,
+            "SRC_TO_DST_IAT_AVG": 5.0,
+            "SRC_TO_DST_IAT_STDDEV": 3.0,
+            "DST_TO_SRC_IAT_MIN": 2.0,
+            "DST_TO_SRC_IAT_MAX": 8.0,
+            "DST_TO_SRC_IAT_AVG": 4.0,
+            "DST_TO_SRC_IAT_STDDEV": 2.0,
+        }
+        feat = extract_from_dataset_record(record)
+        assert feat["iat_median_ms"] is None, "IAT median must be None for dataset records"
+        assert feat["iat_count_total"] is None
+        # But base IAT features should be present
+        assert feat["iat_src_dst_min"] == 1.0
+        assert feat["iat_src_dst_avg"] == 5.0
+
+    def test_e24_dataset_flag_rates_unavailable(self):
+        """E24: TCP flag rates are None for dataset (per-packet flags unavailable)."""
+        from features.enriched_features import extract_from_dataset_record
+
+        record = {"TCP_FLAGS": 0x02}
+        feat = extract_from_dataset_record(record)
+        assert feat["tcp_syn_rate"] is None
+        assert feat["tcp_ack_rate"] is None
+        assert feat["tcp_fin_rate"] is None
+        assert feat["tcp_rst_rate"] is None
+        assert feat["tcp_syn"] == 1.0  # but presence from bitmask is available
+
+    def test_e25_dataset_does_not_crash_minimal_record(self):
+        """E25: Dataset extract handles minimal record (no optional fields) gracefully."""
+        from features.enriched_features import extract_from_dataset_record
+
+        # Minimal record with only TCP flags
+        record = {"TCP_FLAGS": 0x00}
+        feat = extract_from_dataset_record(record)
+        assert feat["tcp_syn"] == 0.0
+        assert feat["tcp_ack"] == 0.0
+        assert feat["payload_mean"] == 0.0
+        assert feat["payload_entropy"] == 0.0
+
+
+class TestEnrichedFeaturesSchemaInvariant:
+
+    """Verify enriched features do NOT change the base 49-feature schema."""
+
+    def test_e_base_49_unchanged(self):
+        """E_base1: FEATURE_COLS still contains exactly 49 entries."""
+        assert len(FEATURE_COLS) == 49, (
+            f"Base feature count changed: {len(FEATURE_COLS)} != 49. "
+            "Enriched features must NOT modify the base schema."
+        )
+
+    def test_e_base_49_no_duplicates(self):
+        """E_base2: FEATURE_COLS has no duplicates."""
+        assert len(FEATURE_COLS) == len(set(FEATURE_COLS)), (
+            "Base FEATURE_COLS now has duplicates — enriched features must NOT "
+            "modify the base schema."
+        )
+
+    def test_e_inference_uses_base_49(self):
+        """E_base3: InferenceEngine still expects 49 features (excluding metadata)."""
+        # Count only the FEATURE_COLS keys in the dummy dict, not metadata fields
+        feat = _dummy_feature_dict(0.0)
+        base_feature_count = sum(1 for k in feat if k in FEATURE_COLS)
+        assert base_feature_count == 49, (
+            f"Base feature count changed: {base_feature_count} != 49. "
+            "Enriched features must NOT modify the base schema."
+        )
+
+    def test_e_gnn_model_still_loads(self):
+        """E_base4: GNN model still loads without changes."""
+        import os
+        gnn_path = os.path.join(_PROJECT_ROOT, "dynamic_temporal_gnn.pt")
+        if not os.path.exists(gnn_path):
+            pytest.skip("dynamic_temporal_gnn.pt not found")
+        import torch
+        state = torch.load(gnn_path, map_location="cpu", weights_only=False)
+        # Verify it's a valid GNN state dict
+        assert "conv1.host_to_service.weight" in state
 
 
 # ─────────────────────────────────────────────────────────────────────────────

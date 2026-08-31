@@ -68,25 +68,33 @@ class GNNOutputRecord:
             raise ValueError(f"gnn_prediction must be 0 or 1, got {self.gnn_prediction}")
         if self.gnn_latency_ms < 0:
             raise ValueError(f"gnn_latency_ms must be >= 0, got {self.gnn_latency_ms}")
+        # Validate temporal_score range - from GNN hidden state L2 norm
+        # GRU hidden states can be arbitrarily large; we don't clamp here but document expectations
 
     def to_dict(self):
         """Serializable dict representation for logging and dashboard integration."""
         return asdict(self)
 
     @classmethod
-    def from_stream_output(cls, flow_id, probs, gnn_latency_ms, stream, edge_idx=-1):
+    def from_stream_output(cls, flow_id, probs, gnn_latency_ms, stream, edge_idx=-1, temporal_shift=None):
         """
         Convenience constructor from OnlineGraphStream.evaluate_realtime_gnn_risk() output.
 
         Args:
             flow_id:        str identifier for this flow
-            probs:          np.ndarray of edge probabilities
+            probs:          np.ndarray of edge probabilities (sigmoid of logits)
             gnn_latency_ms: float GNN inference time in ms
             stream:         OnlineGraphStream instance (for context)
             edge_idx:       int index into probs to extract (default: -1 = last edge)
+            temporal_shift:  float L2 norm of GRU hidden states (supplementary context)
 
         Returns:
             GNNOutputRecord
+
+        Output semantics:
+        - gnn_score: sigmoid edge risk probability [0,1] from GNN classifier
+        - temporal_score: L2 norm of GRU hidden states (supplementary context)
+        - temporal_score is NOT a classification signal; it reflects GRU activation magnitude
         """
         import numpy as np
         if probs is None or len(probs) == 0:
@@ -101,17 +109,19 @@ class GNNOutputRecord:
 
         score = float(np.clip(probs[edge_idx], 0.0, 1.0))
 
-        # Compute temporal score from GRU state norm if available
-        temporal_score = 0.0
-        if stream.prev_host_h is not None:
-            import torch
-            temporal_score = float(torch.norm(stream.prev_host_h).item())
+        # temporal_shift is now computed in evaluate_realtime_gnn_risk()
+        # Fallback to stream state if not provided (for backward compatibility)
+        if temporal_shift is None:
+            temporal_shift = 0.0
+            if stream.prev_host_h is not None:
+                import torch
+                temporal_shift = float(torch.norm(stream.prev_host_h).item())
 
         return cls(
             flow_id=flow_id,
             gnn_score=score,
             gnn_prediction=int(score >= 0.5),
-            temporal_score=round(temporal_score, 6),
+            temporal_score=round(temporal_shift, 6),
             graph_context={
                 "mode":             stream.mode,
                 "snapshot_window": stream.buffer_size,

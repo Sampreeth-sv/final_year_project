@@ -121,11 +121,17 @@ class OnlineGraphStream:
         runs Dynamic Bipartite Temporal GNN inference.
 
         Returns:
-            probs      : np.ndarray of shape (num_edges,) — sigmoid risk per edge
+            probs      : np.ndarray of shape (num_edges,) — sigmoid risk per edge (classification)
+            temporal_shift : float — L2 norm of GRU hidden states (supplementary context)
             pyg_data   : HeteroData — current graph snapshot
             h_map      : dict mapping host_id -> node_index
             s_map      : dict mapping service_id -> node_index
             gnn_latency_ms: float — GNN inference wall-clock time in milliseconds
+
+        Output convention:
+        - probs is the ONLY GNN-produced classification signal (risk probability)
+        - temporal_shift is supplementary context from GNN hidden state magnitude
+        - Both are exposed to Person 2 for fusion alongside upstream scores
         """
         with self._lock:
             if not self.flow_buffer:
@@ -179,6 +185,11 @@ class OnlineGraphStream:
             t_gnn_end = time.perf_counter()
             gnn_latency_ms = (t_gnn_end - t_gnn_start) * 1000.0
 
+            # Compute temporal shift from GRU hidden state L2 norm.
+            # This is supplementary context, NOT a classification signal.
+            # The GNN's actual classification output is `probs` (sigmoid risk).
+            temporal_shift = float(torch.norm(next_host_h).item())
+
             # Persist GRU memory state for next call
             self.prev_host_h    = next_host_h.detach()
             self.prev_service_h = next_service_h.detach()
@@ -186,7 +197,7 @@ class OnlineGraphStream:
             self._prev_num_hosts    = num_hosts
             self._prev_num_services = num_services
 
-        return probs, pyg_data, h_map, s_map, gnn_latency_ms
+        return probs, temporal_shift, pyg_data, h_map, s_map, gnn_latency_ms
 
     @property
     def buffer_size(self):
